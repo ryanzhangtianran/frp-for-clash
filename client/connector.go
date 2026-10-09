@@ -15,9 +15,12 @@
 package client
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
+	"math"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,9 +80,13 @@ func (c *messageConnector) Close() error {
 }
 
 // defaultConnectorImpl is the default implementation of Connector for normal frpc.
+// DialFunc dials the frps server address over a caller-controlled transport.
+type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
 type defaultConnectorImpl struct {
-	ctx context.Context
-	cfg *v1.ClientCommonConfig
+	ctx    context.Context
+	cfg    *v1.ClientCommonConfig
+	dialer DialFunc
 
 	muxSession *fmux.Session
 	quicConn   *quic.Conn
@@ -87,9 +94,16 @@ type defaultConnectorImpl struct {
 }
 
 func NewConnector(ctx context.Context, cfg *v1.ClientCommonConfig) Connector {
+	return NewConnectorWithDialer(ctx, cfg, nil)
+}
+
+// NewConnectorWithDialer is NewConnector with a custom dialer for tcp/websocket/wss transports.
+// The dialer replaces transport.proxyURL and transport.connectServerLocalIP; quic and kcp ignore it.
+func NewConnectorWithDialer(ctx context.Context, cfg *v1.ClientCommonConfig, dialer DialFunc) Connector {
 	return &defaultConnectorImpl{
-		ctx: ctx,
-		cfg: cfg,
+		ctx:    ctx,
+		cfg:    cfg,
+		dialer: dialer,
 	}
 }
 
@@ -205,33 +219,48 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 		}
 	}
 
-	proxyType, addr, auth, err := libnet.ParseProxyURL(c.cfg.Transport.ProxyURL)
+	addr := net.JoinHostPort(c.cfg.ServerAddr, strconv.Itoa(c.cfg.ServerPort))
+	hooks := []libnet.AfterHook{}
+	addTLSHook := func(priority uint64) {
+		if tlsConfig != nil {
+			hooks = append(hooks, libnet.AfterHook{Priority: priority, Hook: func(ctx context.Context, conn net.Conn, _ string) (context.Context, net.Conn, error) {
+				return ctx, tls.Client(conn, tlsConfig), nil
+			}})
+		}
+	}
+	tlsHeadByteHook := libnet.AfterHook{
+		Priority: libnet.DefaultAfterHookPriority,
+		Hook:     netpkg.DialHookCustomTLSHeadByte(tlsConfig != nil, lo.FromPtr(c.cfg.Transport.TLS.DisableCustomTLSFirstByte)),
+	}
+	protocol := c.cfg.Transport.Protocol
+	switch protocol {
+	case "websocket":
+		protocol = "tcp"
+		hooks = append(hooks, libnet.AfterHook{Priority: libnet.DefaultAfterHookPriority, Hook: netpkg.DialHookWebsocket(protocol, "")}, tlsHeadByteHook)
+		addTLSHook(math.MaxUint64)
+	case "wss":
+		protocol = "tcp"
+		addTLSHook(100)
+		// Make sure that if it is wss, the websocket hook is executed after the tls hook.
+		hooks = append(hooks, libnet.AfterHook{Hook: netpkg.DialHookWebsocket(protocol, tlsConfig.ServerName), Priority: 110})
+	default:
+		hooks = append(hooks, tlsHeadByteHook)
+		addTLSHook(math.MaxUint64)
+	}
+
+	if c.dialer != nil && protocol == "tcp" {
+		return dialWithHooks(c.ctx, c.dialer, addr, hooks)
+	}
+
+	proxyType, proxyAddr, auth, err := libnet.ParseProxyURL(c.cfg.Transport.ProxyURL)
 	if err != nil {
 		xl.Errorf("fail to parse proxy url")
 		return nil, err
 	}
 	dialOptions := []libnet.DialOption{}
-	protocol := c.cfg.Transport.Protocol
-	switch protocol {
-	case "websocket":
-		protocol = "tcp"
-		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{Hook: netpkg.DialHookWebsocket(protocol, "")}))
-		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{
-			Hook: netpkg.DialHookCustomTLSHeadByte(tlsConfig != nil, lo.FromPtr(c.cfg.Transport.TLS.DisableCustomTLSFirstByte)),
-		}))
-		dialOptions = append(dialOptions, libnet.WithTLSConfig(tlsConfig))
-	case "wss":
-		protocol = "tcp"
-		dialOptions = append(dialOptions, libnet.WithTLSConfigAndPriority(100, tlsConfig))
-		// Make sure that if it is wss, the websocket hook is executed after the tls hook.
-		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{Hook: netpkg.DialHookWebsocket(protocol, tlsConfig.ServerName), Priority: 110}))
-	default:
-		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{
-			Hook: netpkg.DialHookCustomTLSHeadByte(tlsConfig != nil, lo.FromPtr(c.cfg.Transport.TLS.DisableCustomTLSFirstByte)),
-		}))
-		dialOptions = append(dialOptions, libnet.WithTLSConfig(tlsConfig))
+	for _, h := range hooks {
+		dialOptions = append(dialOptions, libnet.WithAfterHook(h))
 	}
-
 	if c.cfg.Transport.ConnectServerLocalIP != "" {
 		dialOptions = append(dialOptions, libnet.WithLocalAddr(c.cfg.Transport.ConnectServerLocalIP))
 	}
@@ -239,15 +268,28 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 		libnet.WithProtocol(protocol),
 		libnet.WithTimeout(time.Duration(c.cfg.Transport.DialServerTimeout)*time.Second),
 		libnet.WithKeepAlive(time.Duration(c.cfg.Transport.DialServerKeepAlive)*time.Second),
-		libnet.WithProxy(proxyType, addr),
+		libnet.WithProxy(proxyType, proxyAddr),
 		libnet.WithProxyAuth(auth),
 	)
-	conn, err := libnet.DialContext(
-		c.ctx,
-		net.JoinHostPort(c.cfg.ServerAddr, strconv.Itoa(c.cfg.ServerPort)),
-		dialOptions...,
-	)
-	return conn, err
+	return libnet.DialContext(c.ctx, addr, dialOptions...)
+}
+
+// dialWithHooks mirrors libnet.DialContext's after-hook handling for a caller-supplied dialer.
+func dialWithHooks(ctx context.Context, dial DialFunc, addr string, hooks []libnet.AfterHook) (net.Conn, error) {
+	conn, err := dial(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	slices.SortStableFunc(hooks, func(a, b libnet.AfterHook) int { return cmp.Compare(a.Priority, b.Priority) })
+	for _, h := range hooks {
+		var next net.Conn
+		if ctx, next, err = h.Hook(ctx, conn, addr); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		conn = next
+	}
+	return conn, nil
 }
 
 func (c *defaultConnectorImpl) Close() error {

@@ -367,15 +367,33 @@ func LoadClientConfigResult(path string, strict bool) (*ClientConfigLoadResult, 
 		if err := LoadConfigureFromFile(path, &allCfg, strict); err != nil {
 			return nil, err
 		}
-		result.Common = &allCfg.ClientCommonConfig
-		for _, c := range allCfg.Proxies {
-			result.Proxies = append(result.Proxies, c.ProxyConfigurer)
-		}
-		for _, c := range allCfg.Visitors {
-			result.Visitors = append(result.Visitors, c.VisitorConfigurer)
-		}
+		setClientConfigResult(result, &allCfg)
 	}
+	return completeClientConfigResult(result, strict)
+}
 
+// LoadClientConfigResultFromBytes is LoadClientConfigResult for in-memory v1 content (toml/yaml/json).
+func LoadClientConfigResultFromBytes(b []byte, strict bool) (*ClientConfigLoadResult, error) {
+	allCfg := v1.ClientConfig{}
+	if err := LoadConfigure(b, &allCfg, strict); err != nil {
+		return nil, err
+	}
+	result := &ClientConfigLoadResult{}
+	setClientConfigResult(result, &allCfg)
+	return completeClientConfigResult(result, strict)
+}
+
+func setClientConfigResult(result *ClientConfigLoadResult, allCfg *v1.ClientConfig) {
+	result.Common = &allCfg.ClientCommonConfig
+	for _, c := range allCfg.Proxies {
+		result.Proxies = append(result.Proxies, c.ProxyConfigurer)
+	}
+	for _, c := range allCfg.Visitors {
+		result.Visitors = append(result.Visitors, c.VisitorConfigurer)
+	}
+}
+
+func completeClientConfigResult(result *ClientConfigLoadResult, strict bool) (*ClientConfigLoadResult, error) {
 	// Load additional config from includes.
 	// legacy ini format already handle this in ParseClientConfig.
 	if len(result.Common.IncludeConfigFiles) > 0 && !result.IsLegacyFormat {
