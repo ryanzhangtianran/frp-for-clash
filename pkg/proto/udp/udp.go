@@ -74,12 +74,19 @@ func ForwardUserConn(udpConn *net.UDPConn, readCh <-chan *msg.UDPPacket, sendCh 
 	}
 }
 
-func Forwarder(dstAddr *net.UDPAddr, readCh <-chan *msg.UDPPacket, sendCh chan<- msg.Message, bufSize int, proxyProtocolVersion string) {
+// Forwarder relays packets between frps users and dstAddr, one session per user.
+// dial opens a user's session (nil dials dstAddr directly).
+func Forwarder(dstAddr *net.UDPAddr, readCh <-chan *msg.UDPPacket, sendCh chan<- msg.Message, bufSize int, proxyProtocolVersion string,
+	dial func(src *net.UDPAddr) (net.Conn, error),
+) {
+	if dial == nil {
+		dial = func(*net.UDPAddr) (net.Conn, error) { return net.DialUDP("udp", nil, dstAddr) }
+	}
 	var mu sync.RWMutex
-	udpConnMap := make(map[string]*net.UDPConn)
+	udpConnMap := make(map[string]net.Conn)
 
 	// read from dstAddr and write to sendCh
-	writerFn := func(raddr *net.UDPAddr, udpConn *net.UDPConn) {
+	writerFn := func(raddr *net.UDPAddr, udpConn net.Conn) {
 		addr := raddr.String()
 		defer func() {
 			mu.Lock()
@@ -92,7 +99,7 @@ func Forwarder(dstAddr *net.UDPAddr, readCh <-chan *msg.UDPPacket, sendCh chan<-
 		defer pool.PutBuf(buf)
 		for {
 			_ = udpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-			n, _, err := udpConn.ReadFromUDP(buf)
+			n, err := udpConn.Read(buf)
 			if err != nil {
 				return
 			}
@@ -120,7 +127,7 @@ func Forwarder(dstAddr *net.UDPAddr, readCh <-chan *msg.UDPPacket, sendCh chan<-
 			mu.Lock()
 			udpConn, ok := udpConnMap[udpMsg.RemoteAddr.String()]
 			if !ok {
-				udpConn, err = net.DialUDP("udp", nil, dstAddr)
+				udpConn, err = dial(udpMsg.RemoteAddr)
 				if err != nil {
 					mu.Unlock()
 					continue

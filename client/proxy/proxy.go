@@ -155,14 +155,29 @@ func (pxy *BaseProxy) wrapWorkConn(conn net.Conn, encKey []byte) (io.ReadWriteCl
 
 type localDialerKey struct{}
 
-// LocalDialFunc connects a tcp work connection to the proxy's local service.
-// src is the user address reported by frps, nil if unknown.
-type LocalDialFunc func(ctx context.Context, cfg *v1.ProxyBaseConfig, src *net.TCPAddr) (net.Conn, error)
+// LocalDialFunc connects a user session ("tcp" work connection or "udp" session) to the proxy's
+// local service. src is the user address reported by frps, nil if unknown.
+type LocalDialFunc func(ctx context.Context, cfg *v1.ProxyBaseConfig, network string, src net.Addr) (net.Conn, error)
 
 // WithLocalDialer makes proxies of a service run with ctx use dial instead of dialing localIP:localPort,
 // e.g. to route through an embedding application.
 func WithLocalDialer(ctx context.Context, dial LocalDialFunc) context.Context {
 	return context.WithValue(ctx, localDialerKey{}, dial)
+}
+
+// localUDPDial returns the embedder's UDP session dialer, or nil to dial localIP:localPort directly.
+func (pxy *BaseProxy) localUDPDial() func(src *net.UDPAddr) (net.Conn, error) {
+	dial, ok := pxy.ctx.Value(localDialerKey{}).(LocalDialFunc)
+	if !ok {
+		return nil
+	}
+	return func(src *net.UDPAddr) (net.Conn, error) {
+		var addr net.Addr
+		if src != nil {
+			addr = src
+		}
+		return dial(pxy.ctx, pxy.baseCfg, "udp", addr)
+	}
 }
 
 func (pxy *BaseProxy) SetInWorkConnCallback(cb func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool) {
@@ -242,7 +257,11 @@ func (pxy *BaseProxy) HandleTCPWorkConnection(workConn net.Conn, m *msg.StartWor
 
 	var localConn net.Conn
 	if dial, ok := pxy.ctx.Value(localDialerKey{}).(LocalDialFunc); ok {
-		localConn, err = dial(pxy.ctx, baseCfg, srcAddr)
+		var src net.Addr
+		if srcAddr != nil {
+			src = srcAddr
+		}
+		localConn, err = dial(pxy.ctx, baseCfg, "tcp", src)
 	} else {
 		localConn, err = libnet.Dial(
 			net.JoinHostPort(baseCfg.LocalIP, strconv.Itoa(baseCfg.LocalPort)),
